@@ -1,0 +1,197 @@
+#define BLYNK_TEMPLATE_ID "TMPL3c4Ogzfwl"
+#define BLYNK_TEMPLATE_NAME "TRAFFIC MANAGEMENT SYSTEM"
+#define BLYNK_AUTH_TOKEN "fYoVZOrJwf-CMs4w8ib7uIk9GRLCA7Nm"
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+// **Blynk Credentials**
+char auth[] = "fYoVZOrJwf-CMs4w8ib7uIk9GRLCA7Nm"; 
+char ssid[] = "TrafficIOT";  
+char pass[] = "12345678";  
+
+// **ESP32 GPIO Pins for Shift Register**
+#define dataPin 14   
+#define latchPin 12  
+#define clockPin 13  
+
+// **IR Sensor Pins for Traffic Detection**
+#define IR_NORTH 32   
+#define IR_SOUTH 33   
+#define IR_EAST  25   
+#define IR_WEST  26    
+
+// **RFID Pins**
+#define SS_PIN  5    
+#define RST_PIN 22  
+
+// **LED Alert Pin**
+#define ALERT_LED_PIN 27  
+
+// **Initialize RFID Reader**
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// **Blynk Virtual Pins**
+#define VPIN_LED_NORTH   V2
+#define VPIN_LED_SOUTH   V3
+#define VPIN_LED_EAST    V4
+#define VPIN_LED_WEST    V5
+#define VPIN_EMERGENCY_LED V6  
+
+// **Traffic Light States**
+#define NORTH        0b00011000, 0b01001000  
+#define NORTH_YELLOW 0b00101000, 0b01001000  
+#define SOUTH        0b01000010, 0b01001000  
+#define SOUTH_YELLOW 0b01000100, 0b01001000    
+#define EAST         0b01001000, 0b00011000  
+#define EAST_YELLOW  0b01001000, 0b00101000  
+#define WEST         0b01001000, 0b01000010  
+#define WEST_YELLOW  0b01001000, 0b01000100  
+#define ALL_RED      0b01001000, 0b01001000  
+
+// **Traffic Light Timing**
+const unsigned long DEFAULT_GREEN_TIME = 5000; 
+const unsigned long MIN_GREEN_TIME = 3000;     
+const unsigned long MAX_GREEN_TIME = 7000;     
+const unsigned long YELLOW_TIME = 1000;        
+const unsigned long EMERGENCY_TIME = 10000;    
+
+// **Traffic Light Sequence**
+const byte states[][2] = {
+  {NORTH}, {NORTH_YELLOW}, 
+  {SOUTH}, {SOUTH_YELLOW}, 
+  {EAST},  {EAST_YELLOW},  
+  {WEST},  {WEST_YELLOW}   
+};
+
+// **Emergency Mode Variables**
+bool emergencyMode = false;
+unsigned long emergencyStartTime = 0;
+
+// **Function Prototypes**
+void updateLights(byte shiftReg1, byte shiftReg2);
+unsigned long getTrafficBasedTime(uint8_t step);
+void checkTrafficDensity();
+void checkRFID();
+void blinkLED(int duration);
+
+void setup() {
+  Serial.begin(115200); 
+
+  // **Connect to Blynk**
+  WiFi.begin(ssid, pass);
+  Blynk.begin(auth, ssid, pass, "blynk.cloud", 80);
+  
+  // **Initialize RFID and SPI**
+  SPI.begin();
+  rfid.PCD_Init();  
+
+  // **Set Pin Modes**
+  pinMode(dataPin, OUTPUT);
+  pinMode(clockPin, OUTPUT);
+  pinMode(latchPin, OUTPUT);
+  pinMode(IR_NORTH, INPUT);
+  pinMode(IR_SOUTH, INPUT);
+  pinMode(IR_EAST, INPUT);
+  pinMode(IR_WEST, INPUT);
+  pinMode(ALERT_LED_PIN, OUTPUT);
+
+  updateLights(ALL_RED);  // **Start with all red**
+}
+
+void loop() {
+  Blynk.run(); 
+  checkTrafficDensity();
+  checkRFID(); 
+
+  if (emergencyMode && millis() - emergencyStartTime < EMERGENCY_TIME) {
+    return;  
+  }
+  emergencyMode = false;
+  Blynk.virtualWrite(VPIN_EMERGENCY_LED, 0);  
+
+  static uint8_t step = 0;
+  static unsigned long lastChange = 0;
+  
+  unsigned long interval = (step % 2 == 0) ? YELLOW_TIME : getTrafficBasedTime(step);
+
+  if (millis() - lastChange >= interval) {
+    lastChange = millis();
+    updateLights(states[step][0], states[step][1]);
+    step = (step + 1) % 8;  
+  }
+}
+
+// ✅ **Determine Green Time Based on Traffic**
+unsigned long getTrafficBasedTime(uint8_t step) {
+  if ((step == 1 && digitalRead(IR_NORTH) == LOW) ||
+      (step == 3 && digitalRead(IR_SOUTH) == LOW) ||
+      (step == 5 && digitalRead(IR_EAST) == LOW)  ||
+      (step == 7 && digitalRead(IR_WEST) == LOW)) {
+    return MAX_GREEN_TIME;
+  }
+  return MIN_GREEN_TIME;
+}
+
+// ✅ **Check Traffic Density and Update Blynk**
+void checkTrafficDensity() {
+  bool northTraffic = digitalRead(IR_NORTH) == LOW;
+  bool southTraffic = digitalRead(IR_SOUTH) == LOW;
+  bool eastTraffic = digitalRead(IR_EAST) == LOW;
+  bool westTraffic = digitalRead(IR_WEST) == LOW;
+
+  Blynk.virtualWrite(VPIN_LED_NORTH, northTraffic ? 255 : 0);
+  Blynk.virtualWrite(VPIN_LED_SOUTH, southTraffic ? 255 : 0);
+  Blynk.virtualWrite(VPIN_LED_EAST, eastTraffic ? 255 : 0);
+  Blynk.virtualWrite(VPIN_LED_WEST, westTraffic ? 255 : 0);
+}
+
+// ✅ **Check RFID for Emergency & VIP Vehicles**
+void checkRFID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  // **Extract Tag ID**
+  String tagID = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    tagID += String(rfid.uid.uidByte[i], HEX);
+  }
+  Serial.println("RFID Tag Scanned: " + tagID);
+
+  // **Emergency Vehicle RFID**
+  if (tagID == "afac611f") {  
+    Serial.println("🚨 Emergency Vehicle Detected!");
+    emergencyMode = true;
+    emergencyStartTime = millis();
+    Blynk.virtualWrite(VPIN_EMERGENCY_LED, 255);  
+    blinkLED(10000);  // **LED ON for 10 seconds**
+  } 
+  // **VIP Vehicle RFID**
+  else if (tagID == "241451a7") {  
+    Serial.println("⭐ VIP Vehicle Detected!");
+    Blynk.virtualWrite(VPIN_EMERGENCY_LED, 128);  
+    blinkLED(2000);  // **LED ON for 2 seconds**
+  } 
+  else {
+    Serial.println("🔹 Unknown RFID Tag.");
+  }
+
+  rfid.PICC_HaltA();  
+  rfid.PCD_StopCrypto1();
+}
+
+// ✅ **LED Blink Function**
+void blinkLED(int duration) {
+  digitalWrite(ALERT_LED_PIN, HIGH);
+  delay(duration);
+  digitalWrite(ALERT_LED_PIN, LOW);
+}
+
+// ✅ **Control Traffic Lights**
+void updateLights(byte shiftReg1, byte shiftReg2) {
+  digitalWrite(latchPin, LOW);
+  shiftOut(dataPin, clockPin, MSBFIRST, shiftReg2);
+  shiftOut(dataPin, clockPin, MSBFIRST, shiftReg1);
+  digitalWrite(latchPin, HIGH);
+} 
